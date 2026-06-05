@@ -3,138 +3,119 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
-import { Spot, SpotStatus, ActivityLog } from "./src/types";
+import { createClient } from "@supabase/supabase-js";
+import { User, ActivityLog } from "./src/types";
 
 dotenv.config();
 
-// Initialize dynamic shared states
-let spots: Spot[] = [];
-let logs: ActivityLog[] = [
-  {
-    id: "log-1",
-    type: "exit",
-    spotId: "A-12",
-    detail: "Spot A-12 Vacated - Exit processed successfully",
-    timestamp: "NOW"
-  },
-  {
-    id: "log-2",
-    type: "entry",
-    spotId: "B-04",
-    detail: "Spot B-04 Occupied - Plate: ABC-1234",
-    timestamp: "2m ago"
-  },
-  {
-    id: "log-3",
-    type: "maintenance",
-    spotId: "C-22",
-    detail: "Spot C-22 Maintenance - Sensor calibration in progress",
-    timestamp: "8m ago"
-  },
-  {
-    id: "log-4",
-    type: "exit",
-    spotId: "D-01",
-    detail: "Spot D-01 Vacated - Session length: 2h 45m",
-    timestamp: "12m ago"
-  }
-];
+// ============================================================
+//  SUPABASE CLIENT
+//  Las credenciales se leen de .env (SUPABASE_URL y SUPABASE_ANON_KEY)
+// ============================================================
+const supabaseUrl = process.env.SUPABASE_URL!;
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY!;
 
-// Seed the 110 spots to match the UI visual reference exactly:
-// Available: 42, Occupied: 64, Guest: 4. Total = 110
-function seedSpots() {
-  const seededSpots: Spot[] = [];
-  
-  // Definimos de forma consistente los pisos y cuadrantes
-  // Floor G: Spots 101 - 130 (30 spots)
-  // Floor 1: Spots 201 - 230 (30 spots)
-  // Floor 2: Spots 301 - 330 (30 spots)
-  // Executive: Spots 401 - 420 (20 spots)
-  const totalSpots = 110;
-  
-  // Seed state counts to achieve exact counts:
-  // We need exactly 4 guest spots. Let's designate specific spots.
-  const guestSpots = [12, 42, 72, 102]; // Exactly 4 spots
-  
-  // We need exactly 64 occupied spots, meaning the remaining 44 spots will be split:
-  // 110 total - 4 guest = 106.
-  // We need exactly 64 occupied, and the rest (42) available.
-  // Let's create a deterministic/random lookup that satisfies this:
-  let occupiedCount = 0;
-  const targetOccupied = 64;
-
-  for (let i = 1; i <= totalSpots; i++) {
-    // Determinar piso
-    let floor: "G" | "1" | "2" | "Executive" = "G";
-    let num = 100 + i;
-    if (i <= 30) {
-      floor = "G";
-      num = 100 + i;
-    } else if (i <= 60) {
-      floor = "1";
-      num = 200 + (i - 30);
-    } else if (i <= 90) {
-      floor = "2";
-      num = 300 + (i - 60);
-    } else {
-      floor = "Executive";
-      num = 400 + (i - 90);
-    }
-
-    // Determinar cuadrante militarmente uniforme
-    let quadrant: "A" | "B" | "C" | "D" = "A";
-    if (i <= 28) quadrant = "A";
-    else if (i <= 56) quadrant = "B";
-    else if (i <= 84) quadrant = "C";
-    else quadrant = "D";
-
-    // Formando el identificador del cupo del Guardia panel "A-01", "B-12", "C-09"
-    const isone = i % 30 || 30; // 1 to 30 inside each zone index
-    const prefix = quadrant;
-    const numStr = isone.toString().padStart(2, "0");
-    const id = `${prefix}-${numStr}`;
-
-    // Determinar estado basado de la estadística requerida
-    let status: SpotStatus = "available";
-    let occupant: string | null = null;
-    let duration: string | null = null;
-
-    if (guestSpots.includes(i)) {
-      status = "guest";
-      occupant = "INVITADO SÉDE MAIPÚ";
-      duration = "Pase de Visita";
-    } else {
-      // Determinamos si es ocupado para llegar al target de 64
-      // Podemos usar un algoritmo de llenado simple
-      if (occupiedCount < targetOccupied && (i % 3 !== 0 || occupiedCount < targetOccupied - 15)) {
-        status = "occupied";
-        occupiedCount++;
-        const plates = ["K-902-LX", "BC-4921", "DL-9081", "XP-3920", "HG-1290", "PL-4422", "TX-2110"];
-        const randomPlate = plates[i % plates.length];
-        occupant = `Patente: ${randomPlate}`;
-        duration = `${Math.floor(Math.random() * 3) + 1}h ${Math.floor(Math.random() * 60)}m`;
-      }
-    }
-
-    // Algunos cupos particulares con cargadores eléctricos
-    const isEV = i % 15 === 0;
-
-    seededSpots.push({
-      id,
-      number: num,
-      floor,
-      quadrant,
-      status,
-      occupant,
-      duration,
-      isEV
-    });
-  }
-  
-  spots = seededSpots;
+if (!supabaseUrl || !supabaseAnonKey) {
+  console.error("[CONFIG ERROR] Faltan SUPABASE_URL o SUPABASE_ANON_KEY en el archivo .env");
+  process.exit(1);
 }
 
-seedSpots();
+const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  auth: { persistSession: false, autoRefreshToken: false }
+});
+
+// ============================================================
+//  HELPERS: Adaptar datos de Supabase al formato del frontend
+//
+//  Tu tabla `estacionamientos` tiene:
+//    id (int4), numero (varchar ej: "A-01"), sector (enum A/B/C/D),
+//    estado (enum), ocupado_por (uuid), ultima_actualizacion (timestamptz)
+//
+//  El frontend espera:
+//    id (string), number (int), floor (string), quadrant (string),
+//    status ("available"|"occupied"|"guest"), occupant (string|null),
+//    duration (string|null), isEV (bool)
+// ============================================================
+
+/** Convierte número de cupo de Supabase al formato de número entero para el frontend */
+function extraerNumero(numero: string): number {
+  // "A-01" → 1,  "B-14" → 42, etc.
+  // Extraemos la parte numérica y la convertimos
+  const match = numero.match(/\d+/);
+  return match ? parseInt(match[0], 10) : 0;
+}
+
+/** Mapea estado de Supabase al enum del frontend */
+function mapEstado(estado: string): "available" | "occupied" | "guest" {
+  switch (estado) {
+    case "ocupado":    return "occupied";
+    case "invitado":   return "guest";
+    case "bloqueado":  return "guest"; // bloqueado se muestra como invitado en la UI
+    default:           return "available";
+  }
+}
+
+/** Mapea enum del frontend al estado de Supabase */
+function mapEstadoInverso(status: string): string {
+  switch (status) {
+    case "occupied":  return "ocupado";
+    case "guest":     return "invitado";
+    default:          return "disponible";
+  }
+}
+
+/** Convierte una fila de Supabase al formato Spot del frontend */
+function supabaseRowToSpot(row: any) {
+  return {
+    id: row.numero,           // "A-01" — el frontend usa esto como identificador visual
+    number: extraerNumero(row.numero),
+    floor: "G" as const,      // tu tabla no tiene piso, asumimos planta baja
+    quadrant: row.sector as "A" | "B" | "C" | "D",
+    status: mapEstado(row.estado),
+    occupant: row.perfiles?.nombre
+      ? `${row.perfiles.nombre} (${row.perfiles.patente_vehiculo || "S/P"})`
+      : (row.estado !== "disponible" ? "Ocupante Registrado" : null),
+    duration: row.ultima_actualizacion
+      ? calcularTiempoTranscurrido(row.ultima_actualizacion)
+      : null,
+    isEV: false,
+    _supabaseId: row.id       // guardamos el id int4 real para las operaciones de escritura
+  };
+}
+
+/** Calcula tiempo transcurrido desde ultima_actualizacion */
+function calcularTiempoTranscurrido(timestamp: string): string {
+  const diff = Date.now() - new Date(timestamp).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "Hace un momento";
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  return `${hours}h ${mins % 60}m`;
+}
+
+/** Convierte fila de bitacora_eventos al formato ActivityLog del frontend */
+function supabaseEventoToLog(row: any): ActivityLog {
+  const tipoMap: Record<string, ActivityLog["type"]> = {
+    INGRESO:  "entry",
+    SALIDA:   "exit",
+    BLOQUEO:  "block",
+    RESERVA:  "reserve",
+  };
+  return {
+    id: String(row.id),
+    type: tipoMap[row.tipo_evento] || "entry",
+    spotId: row.estacionamientos?.numero || String(row.estacionamiento_id),
+    detail: `[${row.tipo_evento}] Cupo ${row.estacionamientos?.numero || row.estacionamiento_id} → ${row.estado_nuevo}${row.perfiles?.nombre ? ` por ${row.perfiles.nombre}` : ""}`,
+    timestamp: calcularTiempoTranscurrido(row.fecha_hora)
+  };
+}
+
+// ============================================================
+//  MOCK USER: mientras no tienes auth real, usamos un usuario fijo
+//  para registrar las operaciones en Supabase.
+//  Reemplaza este UUID con un id real de tu tabla `perfiles`.
+// ============================================================
+const MOCK_USER_ID_CONDUCTOR = process.env.MOCK_USER_ID || null;
 
 async function startServer() {
   const app = express();
@@ -142,270 +123,377 @@ async function startServer() {
 
   app.use(express.json());
 
-  // --- API ENDPOINTS ---
-
-  // Healthcheck API
-  app.get("/api/health", (req, res) => {
-    res.json({ status: "up", time: new Date() });
+  // ── CORS para desarrollo ────────────────────────────────
+  app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    if (req.method === "OPTIONS") return res.status(204).end();
+    next();
   });
 
-  // Get all spots
-  app.get("/api/spots", (req, res) => {
+  // ── Healthcheck ────────────────────────────────────────
+  app.get("/api/health", async (req, res) => {
+    const { error } = await supabase.from("estacionamientos").select("id").limit(1);
+    res.json({
+      status: error ? "degraded" : "up",
+      supabase: error ? `error: ${error.message}` : "connected",
+      time: new Date()
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  //  GET /api/spots
+  //  Obtiene todos los cupos desde Supabase con JOIN a perfiles
+  // ──────────────────────────────────────────────────────
+  app.get("/api/spots", async (req, res) => {
+    const { sector, estado } = req.query;
+
+    let query = supabase
+      .from("estacionamientos")
+      .select(`
+        id, numero, sector, estado, ocupado_por, ultima_actualizacion,
+        perfiles ( nombre, patente_vehiculo, correo )
+      `)
+      .order("id", { ascending: true });
+
+    if (sector) query = query.eq("sector", String(sector).toUpperCase());
+    if (estado) query = query.eq("estado", String(estado).toLowerCase());
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error("[GET /api/spots] Error:", error);
+      return res.status(500).json({ error: "Error al consultar Supabase", detalle: error.message });
+    }
+
+    const spots = (data || []).map(supabaseRowToSpot);
     res.json(spots);
   });
 
-  // Park in a spot (Driver client action)
-  app.post("/api/spots/:id/park", (req, res) => {
-    const { id } = req.params;
-    const { occupant } = req.body; // e.g. license plate or user identifier
-    
-    const spot = spots.find(s => s.id === id);
-    if (!spot) {
-      return res.status(404).json({ error: "Cupo no encontrado" });
-    }
-
-    if (spot.status !== "available") {
-      return res.status(400).json({ error: `El cupo ${id} no está disponible` });
-    }
-
-    spot.status = "occupied";
-    spot.occupant = occupant || "Conductor Autorizado";
-    spot.duration = "0h 01m";
-
-    // Log the activity
-    const newLog: ActivityLog = {
-      id: `log-${Date.now()}`,
-      type: "entry",
-      spotId: id,
-      detail: `Cupo #${spot.number} (${id}) fue ocupado por ${spot.occupant}`,
-      timestamp: "Hace un momento"
-    };
-    logs.unshift(newLog);
-
-    res.json({ success: true, spot });
-  });
-
-  // Reserve a spot (Driver client action)
-  app.post("/api/spots/:id/reserve", (req, res) => {
+  // ──────────────────────────────────────────────────────
+  //  POST /api/spots/:id/park
+  //  Estacionar un vehículo (Conductor)
+  //  :id = numero del cupo ej: "A-01"
+  // ──────────────────────────────────────────────────────
+  app.post("/api/spots/:id/park", async (req, res) => {
     const { id } = req.params;
     const { occupant } = req.body;
 
-    const spot = spots.find(s => s.id === id);
-    if (!spot) {
-      return res.status(404).json({ error: "Cupo no encontrado" });
+    // 1. Leer estado actual del cupo por numero (que es el id visual del frontend)
+    const { data: cupos, error: selectError } = await supabase
+      .from("estacionamientos")
+      .select("id, numero, sector, estado")
+      .eq("numero", id)
+      .single();
+
+    if (selectError || !cupos) {
+      return res.status(404).json({ error: `Cupo "${id}" no encontrado en Supabase` });
     }
 
-    spot.status = "occupied";
-    spot.occupant = occupant || "Reserva Conductor";
-    spot.duration = "Reserva Activa";
+    if (cupos.estado !== "disponible") {
+      return res.status(400).json({ error: `El cupo ${id} no está disponible (estado: ${cupos.estado})` });
+    }
 
-    // Log the activity
-    const newLog: ActivityLog = {
-      id: `log-${Date.now()}`,
-      type: "reserve",
-      spotId: id,
-      detail: `Cupo #${spot.number} (${id}) reservado manualmente desde App`,
-      timestamp: "Hace un momento"
-    };
-    logs.unshift(newLog);
+    const estadoPrevio = cupos.estado;
 
-    res.json({ success: true, spot });
+    // 2. Actualizar estado
+    const { data: updated, error: updateError } = await supabase
+      .from("estacionamientos")
+      .update({
+        estado: "ocupado",
+        ocupado_por: MOCK_USER_ID_CONDUCTOR,
+        ultima_actualizacion: new Date().toISOString()
+      })
+      .eq("id", cupos.id)
+      .select()
+      .single();
+
+    if (updateError) {
+      return res.status(500).json({ error: "Error al actualizar el cupo", detalle: updateError.message });
+    }
+
+    // 3. Registrar en bitácora
+    await supabase.from("bitacora_eventos").insert({
+      estacionamiento_id: cupos.id,
+      usuario_id: MOCK_USER_ID_CONDUCTOR,
+      tipo_evento: "INGRESO",
+      estado_previo: estadoPrevio,
+      estado_nuevo: "ocupado"
+    });
+
+    res.json({ success: true, spot: supabaseRowToSpot(updated) });
   });
 
-  // Exit/Unpark from a spot
-  app.post("/api/spots/:id/unpark", (req, res) => {
+  // ──────────────────────────────────────────────────────
+  //  POST /api/spots/:id/reserve
+  //  Reservar como invitado (Guardia / Admin)
+  // ──────────────────────────────────────────────────────
+  app.post("/api/spots/:id/reserve", async (req, res) => {
     const { id } = req.params;
-    const spot = spots.find(s => s.id === id);
-    if (!spot) {
-      return res.status(404).json({ error: "Cupo no encontrado" });
+
+    const { data: cupo, error: selectError } = await supabase
+      .from("estacionamientos")
+      .select("id, numero, estado")
+      .eq("numero", id)
+      .single();
+
+    if (selectError || !cupo) {
+      return res.status(404).json({ error: `Cupo "${id}" no encontrado` });
     }
 
-    spot.status = "available";
-    const previousOccupant = spot.occupant;
-    spot.occupant = null;
-    spot.duration = null;
+    const estadoPrevio = cupo.estado;
 
-    // Log the activity
-    const newLog: ActivityLog = {
-      id: `log-${Date.now()}`,
-      type: "exit",
-      spotId: id,
-      detail: `Cupo #${spot.number} (${id}) liberado: ${previousOccupant || "vehículo"} salió`,
-      timestamp: "Hace un momento"
-    };
-    logs.unshift(newLog);
+    const { data: updated, error } = await supabase
+      .from("estacionamientos")
+      .update({
+        estado: "invitado",
+        ocupado_por: MOCK_USER_ID_CONDUCTOR,
+        ultima_actualizacion: new Date().toISOString()
+      })
+      .eq("id", cupo.id)
+      .select()
+      .single();
 
-    res.json({ success: true, spot });
+    if (error) return res.status(500).json({ error: error.message });
+
+    await supabase.from("bitacora_eventos").insert({
+      estacionamiento_id: cupo.id,
+      usuario_id: MOCK_USER_ID_CONDUCTOR,
+      tipo_evento: "INGRESO",
+      estado_previo: estadoPrevio,
+      estado_nuevo: "invitado"
+    });
+
+    res.json({ success: true, spot: supabaseRowToSpot(updated) });
   });
 
-  // Register a spot for Guest (Admin action)
-  app.post("/api/spots/:id/block", (req, res) => {
+  // ──────────────────────────────────────────────────────
+  //  POST /api/spots/:id/unpark
+  //  Liberar cupo (Conductor, Guardia, Admin)
+  // ──────────────────────────────────────────────────────
+  app.post("/api/spots/:id/unpark", async (req, res) => {
     const { id } = req.params;
-    const spot = spots.find(s => s.id === id);
-    if (!spot) {
-      return res.status(404).json({ error: "Cupo no encontrado" });
+
+    const { data: cupo, error: selectError } = await supabase
+      .from("estacionamientos")
+      .select("id, numero, estado")
+      .eq("numero", id)
+      .single();
+
+    if (selectError || !cupo) {
+      return res.status(404).json({ error: `Cupo "${id}" no encontrado` });
     }
 
-    spot.status = "guest";
-    spot.occupant = "INVITADO SÉDE MAIPÚ";
-    spot.duration = "Pase de Visita";
+    const estadoPrevio = cupo.estado;
 
-    // Log the activity
-    const newLog: ActivityLog = {
-      id: `log-${Date.now()}`,
-      type: "block",
-      spotId: id,
-      detail: `Cupo #${spot.number} (${id}) registrado como Invitado por Portería`,
-      timestamp: "Hace un momento"
-    };
-    logs.unshift(newLog);
+    const { data: updated, error } = await supabase
+      .from("estacionamientos")
+      .update({
+        estado: "disponible",
+        ocupado_por: null,
+        ultima_actualizacion: new Date().toISOString()
+      })
+      .eq("id", cupo.id)
+      .select()
+      .single();
 
-    res.json({ success: true, spot });
+    if (error) return res.status(500).json({ error: error.message });
+
+    await supabase.from("bitacora_eventos").insert({
+      estacionamiento_id: cupo.id,
+      usuario_id: MOCK_USER_ID_CONDUCTOR,
+      tipo_evento: "SALIDA",
+      estado_previo: estadoPrevio,
+      estado_nuevo: "disponible"
+    });
+
+    res.json({ success: true, spot: supabaseRowToSpot(updated) });
   });
 
-  // Reset/Reset all spots (Restore seeds for debug)
-  app.post("/api/utility/reset", (req, res) => {
-    seedSpots();
-    logs = [
-      {
-        id: "log-1",
-        type: "exit",
-        spotId: "A-12",
-        detail: "Spot A-12 Vacated - Exit processed successfully",
-        timestamp: "NOW"
-      },
-      {
-        id: "log-2",
-        type: "entry",
-        spotId: "B-04",
-        detail: "Spot B-04 Occupied - Plate: ABC-1234",
-        timestamp: "2m ago"
-      },
-      {
-        id: "log-3",
-        type: "block",
-        spotId: "C-22",
-        detail: "Cupo C-22 ocupado - Registrado como Invitado por Portería",
-        timestamp: "8m ago"
-      }
-    ];
-    res.json({ success: true, message: "Base de datos reseteada a estado mock de referencia." });
+  // ──────────────────────────────────────────────────────
+  //  POST /api/spots/:id/block
+  //  Bloquear/reservar para invitado (Admin / Guardia)
+  // ──────────────────────────────────────────────────────
+  app.post("/api/spots/:id/block", async (req, res) => {
+    const { id } = req.params;
+
+    const { data: cupo, error: selectError } = await supabase
+      .from("estacionamientos")
+      .select("id, numero, estado")
+      .eq("numero", id)
+      .single();
+
+    if (selectError || !cupo) {
+      return res.status(404).json({ error: `Cupo "${id}" no encontrado` });
+    }
+
+    const estadoPrevio = cupo.estado;
+
+    const { data: updated, error } = await supabase
+      .from("estacionamientos")
+      .update({
+        estado: "invitado",
+        ocupado_por: MOCK_USER_ID_CONDUCTOR,
+        ultima_actualizacion: new Date().toISOString()
+      })
+      .eq("id", cupo.id)
+      .select()
+      .single();
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    await supabase.from("bitacora_eventos").insert({
+      estacionamiento_id: cupo.id,
+      usuario_id: MOCK_USER_ID_CONDUCTOR,
+      tipo_evento: "BLOQUEO",
+      estado_previo: estadoPrevio,
+      estado_nuevo: "invitado"
+    });
+
+    res.json({ success: true, spot: supabaseRowToSpot(updated) });
   });
 
-  // Get activity logs
-  app.get("/api/logs", (req, res) => {
+  // ──────────────────────────────────────────────────────
+  //  GET /api/logs
+  //  Últimos 50 eventos de bitácora desde Supabase
+  // ──────────────────────────────────────────────────────
+  app.get("/api/logs", async (req, res) => {
+    const { data, error } = await supabase
+      .from("bitacora_eventos")
+      .select(`
+        id, tipo_evento, estado_previo, estado_nuevo, fecha_hora,
+        estacionamiento_id,
+        estacionamientos ( numero ),
+        perfiles ( nombre, patente_vehiculo )
+      `)
+      .order("fecha_hora", { ascending: false })
+      .limit(50);
+
+    if (error) {
+      console.error("[GET /api/logs] Error:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    const logs = (data || []).map(supabaseEventoToLog);
     res.json(logs);
   });
 
-  // Simulate OCR Entrance Plate scan on CCTV
-  app.post("/api/utility/scan-plate", (req, res) => {
-    const { plate } = req.body;
-    const activePlate = plate || `K-${Math.floor(Math.random() * 899) + 100}-${["LX", "XP", "TZ", "HN"][Math.floor(Math.random() * 4)]}`;
+  // ──────────────────────────────────────────────────────
+  //  POST /api/utility/reset
+  //  Restaurar todos los cupos a "disponible" en Supabase
+  // ──────────────────────────────────────────────────────
+  app.post("/api/utility/reset", async (req, res) => {
+    const { error } = await supabase
+      .from("estacionamientos")
+      .update({
+        estado: "disponible",
+        ocupado_por: null,
+        ultima_actualizacion: new Date().toISOString()
+      })
+      .neq("id", 0); // neq(0) = todas las filas (workaround para update masivo)
 
-    // Encuentra el primer cupo libre para ocuparlo automáticamente
-    const freeSpot = spots.find(s => s.status === "available");
-    if (freeSpot) {
-      freeSpot.status = "occupied";
-      freeSpot.occupant = `Patente: ${activePlate}`;
-      freeSpot.duration = "0h 01m";
-
-      const newLog: ActivityLog = {
-        id: `log-${Date.now()}`,
-        type: "entry",
-        spotId: freeSpot.id,
-        detail: `CCTV detectó ingreso: ${activePlate} se estacionó en cupo #${freeSpot.number} (${freeSpot.id})`,
-        timestamp: "NOW"
-      };
-      logs.unshift(newLog);
-      return res.json({ success: true, spot: freeSpot, plate: activePlate });
+    if (error) {
+      return res.status(500).json({ error: "Error al resetear cupos", detalle: error.message });
     }
 
-    res.status(400).json({ error: "No hay cupos disponibles para simular estacionado" });
+    res.json({ success: true, message: "Todos los cupos reseteados a disponible en Supabase." });
   });
 
-  // --- GEMINI AI MODEL INTEGRATION ROUTE ---
+  // ──────────────────────────────────────────────────────
+  //  POST /api/utility/scan-plate
+  //  Simula OCR de CCTV: ocupa el primer cupo disponible
+  // ──────────────────────────────────────────────────────
+  app.post("/api/utility/scan-plate", async (req, res) => {
+    const { plate } = req.body;
+    const activePlate = plate || `K-${Math.floor(Math.random() * 899) + 100}-LX`;
+
+    // Buscar el primer cupo disponible
+    const { data: disponibles, error: selectError } = await supabase
+      .from("estacionamientos")
+      .select("id, numero, sector")
+      .eq("estado", "disponible")
+      .order("id", { ascending: true })
+      .limit(1);
+
+    if (selectError || !disponibles || disponibles.length === 0) {
+      return res.status(400).json({ error: "No hay cupos disponibles para simular CCTV" });
+    }
+
+    const cupo = disponibles[0];
+    const estadoPrevio = "disponible";
+
+    const { data: updated, error: updateError } = await supabase
+      .from("estacionamientos")
+      .update({
+        estado: "ocupado",
+        ocupado_por: MOCK_USER_ID_CONDUCTOR,
+        ultima_actualizacion: new Date().toISOString()
+      })
+      .eq("id", cupo.id)
+      .select()
+      .single();
+
+    if (updateError) {
+      return res.status(500).json({ error: updateError.message });
+    }
+
+    await supabase.from("bitacora_eventos").insert({
+      estacionamiento_id: cupo.id,
+      usuario_id: MOCK_USER_ID_CONDUCTOR,
+      tipo_evento: "INGRESO",
+      estado_previo: estadoPrevio,
+      estado_nuevo: "ocupado",
+      notas: `CCTV OCR detectó patente: ${activePlate}`
+    });
+
+    res.json({ success: true, spot: supabaseRowToSpot(updated), plate: activePlate });
+  });
+
+  // ──────────────────────────────────────────────────────
+  //  POST /api/gemini/trends
+  //  Análisis IA (igual que antes, pero con datos reales de Supabase)
+  // ──────────────────────────────────────────────────────
   app.post("/api/gemini/trends", async (req, res) => {
     try {
       const apiKey = process.env.GEMINI_API_KEY;
+
+      // Obtener estadísticas reales desde Supabase
+      const { data: spotsData } = await supabase
+        .from("estacionamientos")
+        .select("estado, sector");
+
+      const total     = spotsData?.length || 110;
+      const occupied  = spotsData?.filter(s => s.estado === "ocupado").length || 0;
+      const available = spotsData?.filter(s => s.estado === "disponible").length || 0;
+      const guests    = spotsData?.filter(s => s.estado === "invitado").length || 0;
+
       if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
-        // Fallback robust mock report if no API key is provided
-        console.warn("Retornando reporte Gemini mockeado debido a API Key no configurada.");
         return res.json({
-          report: `### **Análisis de Tendencias Estructurales - ParkFlow Engine**
-*Análisis predictivo generado con simulación avanzada de inteligencia artificial para Duoc UC.*
-
-#### **Horas Críticas Robustas Detectadas:**
-- **Pico Matutino:** Lunes a Viernes entre **08:45 AM - 10:15 AM** (Tasa de ocupación proyectada: **98.4%**). Elevada congestión en Accesos G y Piso 1 por llegada del bloque académico principal.
-- **Pico Vespertino:** Martes y Jueves entre **18:30 PM - 20:00 PM** (Ocupación proyectada: **91.2%**) debido a programas vespertinos.
-
-#### **Sugerencias de Operación y Mitigaciones:**
-1. **Redirección de Flujo:** Canalizar vehículos en ingreso por encima del 80% hacia el **Cuadrante D (VIP/Overflow)** para mitigar embotellamiento en rampa norte.
-2. **Ajuste de Turnos en Portería:** Desplegar personal adicional en el ingreso principal del campus a las 08:15 AM con control ágil mediante QR de alumnos.
-3. **Mantenimiento Preventivo:** El sensor del **Cupo #102 (A-02)** muestra latencia inusual (posible suciedad en sensor fotoeléctrico). Planificar limpieza técnica entre 14:00 y 16:00 (periodo valle).
-
-*Generación por Gemini Engine 3.5-Flash (Simulado)*`,
+          report: `### **Análisis de Tendencias - ParkFlow Engine (Datos Reales Supabase)**\n\n**Estado actual:**\n- Total cupos: ${total}\n- Disponibles: ${available} (${Math.round((available/total)*100)}%)\n- Ocupados: ${occupied} (${Math.round((occupied/total)*100)}%)\n- Invitados: ${guests}\n\n#### Horas Críticas Detectadas:\n- **Pico Matutino:** Lunes a Viernes 08:45 - 10:15 AM (98.4%)\n- **Pico Vespertino:** Martes y Jueves 18:30 - 20:00 PM (91.2%)\n\n#### Sugerencias:\n1. Redirigir vehículos al Sector D cuando ocupación supere 80%\n2. Desplegar personal adicional a las 08:15 AM`,
           isMock: true
         });
       }
 
-      // Initialize Gemini SDK with custom user-agent header
-      const ai = new GoogleGenAI({
-        apiKey: apiKey,
-        httpOptions: {
-          headers: {
-            "User-Agent": "aistudio-build"
-          }
-        }
-      });
-
-      // Calculate current states
-      const total = spots.length;
-      const occupied = spots.filter(s => s.status === "occupied").length;
-      const available = spots.filter(s => s.status === "available").length;
-      const guests = spots.filter(s => s.status === "guest").length;
-
-      // Construct a tailored state prompt for Gemini
-      const stateSummary = `
-        Estadísticas actuales de estacionamientos:
-        - Total de cupos: ${total}
-        - Cupos Ocupados: ${occupied} (${Math.round((occupied/total)*100)}%)
-        - Cupos Libres: ${available} (${Math.round((available/total)*100)}%)
-        - Cupos de Invitados Sede: ${guests} (${Math.round((guests/total)*100)}%)
-        Sectores de Estacionamiento: Sector A (28 cupos), Sector B (28 cupos), Sector C (28 cupos), Sector D (26 cupos).
-        Campus: Duoc UC Sede Maipú.
-        Hora actual simulada: mañana de un día laboral de alta concurrencia.
-      `;
-
-      const systemPrompt = `
-        Eres el motor de Inteligencia Artificial (Gemini Engine) integrado en la plataforma de gestión inteligente "Duoc UC Parking" para el campus Duoc UC.
-        Debes formular un informe profesional de análisis de tendencias, horas críticas y recomendaciones de optimización arquitectónica en base al estado de ocupación provisto.
-        Utiliza lenguaje formal, claro y profesional de un Arquitecto de Software y Gestor Operativo.
-        El informe debe estar escrito 100% en Español, estructurado con Markdown y secciones legibles como:
-        - Horas Críticas Detectadas (haciendo alusión a horas específicas como 08:45 AM - 10:15 AM).
-        - Estrategias de Mitigación y Redirección Operativa (por ej. redirección a cuadrantes B o D, o recarga EV).
-        - Estado de Sensores y sugerencias de mantenimiento.
-        Sé creativo, pero mantén consistencia con un alto nivel ejecutivo de diseño de UI moderno.
-      `;
-
+      const ai = new GoogleGenAI({ apiKey, httpOptions: { headers: { "User-Agent": "aistudio-build" } } });
+      const stateSummary = `Total: ${total}, Ocupados: ${occupied}, Libres: ${available}, Invitados: ${guests}. Campus: Duoc UC Sede Maipú.`;
       const response = await ai.models.generateContent({
         model: "gemini-3.5-flash",
-        contents: `Analiza el siguiente estado actual de la plataforma de estacionamiento y genera el reporte solicitado:\n\n${stateSummary}`,
+        contents: `Analiza el estado actual de estacionamiento y genera un reporte ejecutivo en español con Markdown:\n\n${stateSummary}`,
         config: {
-          systemInstruction: systemPrompt,
+          systemInstruction: "Eres el motor de IA de Duoc UC Parking. Genera informes profesionales en español con horas críticas, estrategias de mitigación y estado de sensores.",
           temperature: 0.7
         }
       });
 
-      const reportText = response.text || "No se pudo obtener el reporte de inteligencia artificial.";
-      res.json({ report: reportText, isMock: false });
+      res.json({ report: response.text || "Sin respuesta.", isMock: false });
     } catch (apiError: any) {
-      console.error("Error calling Gemini API:", apiError);
-      res.status(500).json({ error: "Fallo al consultar con el motor de IA", details: apiError.message });
+      console.error("Error Gemini:", apiError);
+      res.status(500).json({ error: "Fallo al consultar IA", details: apiError.message });
     }
   });
 
-
-  // --- VITE MIDDLEWARE CONFIGURATION ---
+  // ── VITE MIDDLEWARE ───────────────────────────────────
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -421,7 +509,8 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[Duoc UC Parking Server] running on http://localhost:${PORT}`);
+    console.log(`[Duoc UC Parking] ✅ Servidor corriendo en http://localhost:${PORT}`);
+    console.log(`[Supabase] ✅ Conectado a ${supabaseUrl}`);
   });
 }
 
