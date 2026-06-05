@@ -1,0 +1,6 @@
+{
+  "name": "Duoc UC Parking",
+  "description": "Plataforma de gestión de estacionamientos inteligente con vistas para conductores, guardias y administradores, equipada con predicciones y análisis de tendencias impulsadas por Gemini AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
